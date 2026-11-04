@@ -23,7 +23,16 @@ data class Txn(
     val include: Boolean,
     val raw: String,
     val parsed: Boolean,        // 금액을 문자에서 읽었는가
+    val kind: String = "",      // "" 일반 결제 / 자동납부 / 이용금액 안내 …
+    val decision: Int = 0,      // 0 미정(확인 필요), 1 결제로, -1 무시 — 일반 결제는 항상 1
 ) {
+    /** 목록·합계에 보이는 건 */
+    val shown: Boolean get() = kind.isEmpty() || decision == 1
+    val needsCheck: Boolean get() = kind.isNotEmpty() && decision == 0
+    /** 확인 기억용 열쇠 (유형 + 가맹점) */
+    val ruleKey: String get() = "$card|$kind|$merchant"
+    val kindKey: String get() = "$card|$kind|*"
+
     val signed: Long get() = if (cancel) -amount else amount
 }
 
@@ -51,7 +60,7 @@ data class Extra(
 )
 
 val DEFAULT_CARDS = listOf(
-    CardConf("hyundai", "현대카드", "현대", listOf("15776000"), true),
+    CardConf("hyundai", "현대카드", "현대", listOf("15776200"), true),
     CardConf("woori", "우리카드", "우리", listOf("15889955"), true),
     CardConf("lotte", "롯데카드", "롯데", listOf("15888100"), true),
 )
@@ -88,7 +97,8 @@ object Store {
             }
             // 새로 생긴 기본 카드가 빠져 있으면 뒤에 붙임
             for (d in DEFAULT_CARDS) if (list.none { it.id == d.id }) list.add(d)
-            list
+            // 첫 버전 기본값(현대 1577-6000)은 실제 문자 번호 1577-6200으로 보정
+            list.map { if (it.id == "hyundai" && "15776200" !in it.numbers) it.copy(numbers = it.numbers + "15776200") else it }
         } catch (_: Exception) { DEFAULT_CARDS }
     }
 
@@ -136,6 +146,19 @@ object Store {
             })
         }
         prefs(ctx).edit().putString("extras", arr.toString()).apply()
+    }
+
+    /** 확인 필요 건에 대한 선택 기억: 열쇠 → 1 결제로 / -1 무시 */
+    fun loadRules(ctx: Context): Map<String, Int> {
+        val s = prefs(ctx).getString("rules", null) ?: return emptyMap()
+        return try {
+            val o = JSONObject(s); o.keys().asSequence().associateWith { o.getInt(it) }
+        } catch (_: Exception) { emptyMap() }
+    }
+
+    fun saveRules(ctx: Context, m: Map<String, Int>) {
+        val o = JSONObject(); m.forEach { (k, v) -> o.put(k, v) }
+        prefs(ctx).edit().putString("rules", o.toString()).apply()
     }
 
     fun bgColor(ctx: Context): Long = prefs(ctx).getLong("bg", 0xFFFFFFFF)
@@ -197,16 +220,34 @@ object Settle {
     const val BY_DATE = 0
     const val BY_CARD = 1
 
-    private const val LINE = "--------------------------------"
-    private const val DLINE = "================================"
+    private const val LINE = "────────────────"
+    private val dayHead = SimpleDateFormat("M월 d일 (E)", Locale.KOREA)
+    private val dayKey = SimpleDateFormat("yyyyMMdd", Locale.KOREA)
 
-    private fun row(t: Txn, tag: String): String {
-        val name = t.merchant.ifBlank { "(가맹점 없음)" }
+    private fun label(t: Txn): String {
+        val name = t.merchant.ifBlank { t.kind.ifBlank { "결제" } }
         val extra = buildString {
             if (t.cancel) append(" (취소)")
             if (t.installment.isNotBlank() && t.installment != "일시불") append(" (${t.installment})")
         }
-        return "${rowTime(t.time)} $tag$name$extra  ${won(t.signed)}"
+        return name + extra
+    }
+
+    /** 날짜별로 묶어서 적기 */
+    private fun byDay(sb: StringBuilder, list: List<Txn>, tagOf: (Txn) -> String) {
+        var last = ""
+        for (t in list) {
+            val k = dayKey.format(t.time)
+            if (k != last) {
+                if (last.isNotEmpty()) sb.append('\n')
+                sb.append(dayHead.format(t.time)).append('\n')
+                last = k
+            }
+            val tag = tagOf(t)
+            sb.append("  ").append(label(t))
+            if (tag.isNotEmpty()) sb.append(" · ").append(tag)
+            sb.append("   ").append(won(t.signed)).append('\n')
+        }
     }
 
     private fun extraLines(sb: StringBuilder, extras: List<Extra>, from: Long, to: Long): Long {
@@ -216,65 +257,64 @@ object Settle {
             if (n == 0) continue
             val tot = e.amount * n
             sum += tot
-            if (n == 1) sb.append("${e.name}  ${won(tot)}\n")
-            else sb.append("${e.name}  ${won(e.amount)} x ${n}개월 = ${won(tot)}\n")
+            if (n == 1) sb.append("  ${e.name}   ${won(tot)}\n")
+            else sb.append("  ${e.name}   ${won(e.amount)} × ${n}개월 = ${won(tot)}\n")
         }
         return sum
     }
+
+    fun visible(txns: List<Txn>) = txns.filter { it.include && it.shown }.sortedBy { it.time }
 
     fun build(
         mode: Int, cards: List<CardConf>, txns: List<Txn>, extras: List<Extra>,
         withExtras: Boolean, from: Long, to: Long,
     ): String {
         val sb = StringBuilder()
-        val list = txns.filter { it.include }.sortedBy { it.time }
+        val list = visible(txns)
         val activeExtras = if (withExtras) extras.filter { it.countIn(from, to) > 0 } else emptyList()
-        sb.append("결제 정산 (${dayText(from)} ~ ${dayText(to)})\n")
+        sb.append("결제 정산  ${dayText(from)} ~ ${dayText(to)}\n\n")
 
         if (mode == BY_DATE) {
-            sb.append(LINE).append('\n')
-            if (list.isEmpty()) sb.append("(카드 결제 없음)\n")
             val nameOf = cards.associate { it.id to it.short }
-            for (t in list) sb.append(row(t, "[${nameOf[t.card] ?: ""}] ")).append('\n')
-            sb.append(LINE).append('\n')
+            if (list.isEmpty()) sb.append("카드 결제 없음\n")
+            byDay(sb, list) { nameOf[it.card] ?: "" }
+            sb.append('\n').append(LINE).append('\n')
             val cardSum = list.sumOf { it.signed }
-            sb.append("카드 결제 ${list.size}건  ${won(cardSum)}\n")
+            sb.append("카드 결제 ${list.size}건   ${won(cardSum)}\n")
             var extraSum = 0L
             if (activeExtras.isNotEmpty()) {
-                sb.append('\n').append("[기타 비용]\n")
+                sb.append("기타 비용\n")
                 extraSum = extraLines(sb, activeExtras, from, to)
             }
-            sb.append(DLINE).append('\n')
-            sb.append("총금액  ${won(cardSum + extraSum)}\n")
+            sb.append(LINE).append('\n')
+            sb.append("총금액   ${won(cardSum + extraSum)}\n")
         } else {
             val sums = ArrayList<Pair<String, Long>>()
             for (c in cards) {
                 val mine = list.filter { it.card == c.id }
-                sb.append('\n').append("[${c.name}]\n")
-                if (mine.isEmpty()) sb.append("(결제 없음)\n")
-                for (t in mine) sb.append(row(t, "")).append('\n')
                 val s = mine.sumOf { it.signed }
-                sb.append(LINE).append('\n')
-                sb.append("${c.name} 합계 ${mine.size}건  ${won(s)}\n")
+                sb.append("■ ${c.name}  ${mine.size}건\n\n")
+                if (mine.isEmpty()) sb.append("  결제 없음\n")
+                byDay(sb, mine) { "" }
+                sb.append("\n${c.name} 합계   ${won(s)}\n\n")
                 sums.add(c.name to s)
             }
             if (activeExtras.isNotEmpty()) {
-                sb.append('\n').append("[기타 비용]\n")
+                sb.append("■ 기타 비용\n\n")
                 val s = extraLines(sb, activeExtras, from, to)
-                sb.append(LINE).append('\n')
-                sb.append("기타 비용 합계  ${won(s)}\n")
+                sb.append("\n기타 비용 합계   ${won(s)}\n\n")
                 sums.add("기타 비용" to s)
             }
-            sb.append('\n').append(DLINE).append('\n')
-            for ((n, s) in sums) sb.append("$n  ${won(s)}\n")
             sb.append(LINE).append('\n')
-            sb.append("총금액  ${won(sums.sumOf { it.second })}\n")
+            for ((n, v) in sums) sb.append("$n   ${won(v)}\n")
+            sb.append(LINE).append('\n')
+            sb.append("총금액   ${won(sums.sumOf { it.second })}\n")
         }
         return sb.toString()
     }
 
     fun total(txns: List<Txn>, extras: List<Extra>, withExtras: Boolean, from: Long, to: Long): Long =
-        txns.filter { it.include }.sumOf { it.signed } +
+        visible(txns).sumOf { it.signed } +
                 (if (withExtras) extras.sumOf { it.totalIn(from, to) } else 0L)
 
     fun fileName(from: Long, to: Long) = "정산_${fileFmt.format(from)}-${fileFmt.format(to)}.txt"

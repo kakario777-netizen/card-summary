@@ -32,6 +32,14 @@ object SmsReader {
     }
 
     fun read(ctx: Context, from: Long, to: Long): ReadResult {
+        val r0 = readRaw(ctx, from, to)
+        val r = ReadResult()
+        r.status.putAll(r0.status)
+        r0.msgs.forEach { r.msgs.add(it.copy(body = SmsParser.normalize(it.body).trim())) }
+        return r
+    }
+
+    private fun readRaw(ctx: Context, from: Long, to: Long): ReadResult {
         val r = ReadResult()
         for ((name, fn) in listOf<Pair<String, () -> Int>>(
             "SMS" to { readSms(ctx, from, to, r.msgs) },
@@ -131,7 +139,9 @@ object SmsReader {
                 val body = it.str("body") ?: continue
                 val time = ms(it.lng("date"))
                 if (time < from || time > to) continue
-                out.add(Msg(it.str("address") ?: "", body, time, "RCS")); n++
+                val addr = listOf("address", "sender", "from_address", "remote_uri", "recipients")
+                    .mapNotNull { k -> it.str(k) }.firstOrNull { a -> digits(a).length >= 4 } ?: ""
+                out.add(Msg(addr, body, time, "RCS")); n++
             }
         }
         return n
@@ -159,10 +169,15 @@ object SmsReader {
         if (!SmsParser.looksLikePayment(m.body)) return null
         val on = cards.filter { it.enabled }
         return on.firstOrNull { numberMatch(m.address, it.numbers) }
-            ?: on.firstOrNull { bodyMatch(m.body, it) && (m.body.contains("승인") || m.body.contains("취소")) }
+            ?: on.firstOrNull {
+                bodyMatch(m.body, it) && (m.body.contains("승인") || m.body.contains("취소") || SmsParser.kindOf(m.body).isNotEmpty())
+            }
     }
 
-    fun toTxns(msgs: List<Msg>, cards: List<CardConf>, from: Long, to: Long, startId: Long, forced: String? = null): List<Txn> {
+    fun toTxns(
+        msgs: List<Msg>, cards: List<CardConf>, from: Long, to: Long, startId: Long,
+        forced: String? = null, rules: Map<String, Int> = emptyMap(),
+    ): List<Txn> {
         val result = ArrayList<Txn>()
         val seen = HashSet<String>()
         var id = startId
@@ -170,23 +185,23 @@ object SmsReader {
             val card = forced?.takeIf { SmsParser.looksLikePayment(m.body) } ?: cardFor(m, cards)?.id ?: continue
             val r = SmsParser.parse(m.body, m.time)
             if (r.time < from || r.time > to) continue
-            val key = "$card|${r.amount}|${r.cancel}|${r.time / 60000}"
+            val key = "$card|${r.amount}|${r.cancel}|${r.kind}|${r.time / 60000}"
             if (!seen.add(key)) continue   // 같은 문자가 여러 곳에 저장된 경우
-            result.add(
-                Txn(
-                    id = id++, card = card, time = r.time, merchant = r.merchant,
-                    amount = r.amount, cancel = r.cancel, installment = r.installment,
-                    include = r.ok, raw = m.body.trim(), parsed = r.ok
-                )
+            var t = Txn(
+                id = id++, card = card, time = r.time, merchant = r.merchant,
+                amount = r.amount, cancel = r.cancel, installment = r.installment,
+                include = r.ok, raw = m.body.trim(), parsed = r.ok, kind = r.kind,
             )
+            if (t.kind.isNotEmpty()) t = t.copy(decision = rules[t.ruleKey] ?: rules[t.kindKey] ?: 0)
+            result.add(t)
         }
         return result
     }
 
-    fun collect(ctx: Context, cards: List<CardConf>, from: Long, to: Long): List<Txn> {
+    fun collect(ctx: Context, cards: List<CardConf>, from: Long, to: Long, rules: Map<String, Int>): List<Txn> {
         // 기간 마지막 날 밤 결제가 다음 날 문자로 오는 경우까지 하루 더 읽음
         val msgs = inbox(ctx, from, to + DAY)
-        return toTxns(msgs, cards, from, to, 1L)
+        return toTxns(msgs, cards, from, to, 1L, rules = rules)
     }
 
     /** 최근 문자에서 키워드가 들어간 결제 문자를 보낸 번호 찾기 (번호 → 건수) */
@@ -219,6 +234,11 @@ object SmsReader {
         val from = to - days * DAY
         val r = read(ctx, from, to)
         sb.append("최근 ${days}일 받은 문자\n")
+        try {
+            ctx.contentResolver.query(Uri.parse("content://im/chat"), null, null, null, "_id DESC LIMIT 1")?.use {
+                sb.append("- RCS 칸 이름: ${it.columnNames.joinToString(",").take(300)}\n")
+            }
+        } catch (_: Exception) { }
         r.status.forEach { (k, v) -> sb.append("- $k: $v\n") }
 
         val senders = r.msgs.groupingBy { digits(it.address).ifEmpty { "(번호없음)" } }.eachCount()
@@ -235,7 +255,7 @@ object SmsReader {
             val pay = SmsParser.looksLikePayment(m.body)
             val c = cardFor(m, cards)
             val verdict = when {
-                c != null -> "→ ${c.name}로 인식"
+                c != null -> "→ ${c.name}로 인식" + if (numberMatchAny(m.address, cards)) " (번호)" else " (문자 내용)"
                 !pay -> "→ 결제 문자 아님(금액/승인 못 찾음)"
                 else -> "→ 결제 문자지만 카드 못 정함"
             }
@@ -245,6 +265,8 @@ object SmsReader {
         }
         return sb.toString()
     }
+
+    private fun numberMatchAny(addr: String, cards: List<CardConf>) = cards.any { numberMatch(addr, it.numbers) }
 
     /* ---------- 붙여넣기 ---------- */
 

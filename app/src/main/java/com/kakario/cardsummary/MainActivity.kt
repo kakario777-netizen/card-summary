@@ -166,6 +166,7 @@ fun App(onBg: (Long) -> Unit, shared: String?, onSharedUsed: () -> Unit) {
     var screen by remember { mutableStateOf(Screen.MAIN) }
     var cards by remember { mutableStateOf(Store.loadCards(ctx)) }
     var extras by remember { mutableStateOf(Store.loadExtras(ctx)) }
+    var rules by remember { mutableStateOf(Store.loadRules(ctx)) }
     var mode by remember { mutableIntStateOf(0) }          // 0 이번 달, 1 지난달, 2 직접
     var from by remember { mutableLongStateOf(monthRange(0).first) }
     var to by remember { mutableLongStateOf(monthRange(0).second) }
@@ -181,7 +182,7 @@ fun App(onBg: (Long) -> Unit, shared: String?, onSharedUsed: () -> Unit) {
         val cs = cards; val f = from; val t = to
         scope.launch {
             val list = try {
-                withContext(Dispatchers.IO) { SmsReader.collect(ctx, cs, f, t) }
+                withContext(Dispatchers.IO) { SmsReader.collect(ctx, cs, f, t, rules) }
             } catch (e: Exception) {
                 Toast.makeText(ctx, "문자를 읽지 못했어요: ${e.message}", Toast.LENGTH_LONG).show()
                 emptyList()
@@ -197,7 +198,7 @@ fun App(onBg: (Long) -> Unit, shared: String?, onSharedUsed: () -> Unit) {
     fun addPasted(text: String, forced: String?) {
         val msgs = SmsReader.splitPasted(text)
         val startId = (txns.maxOfOrNull { it.id } ?: 0) + 1
-        val add = SmsReader.toTxns(msgs, cards, 0L, Long.MAX_VALUE, startId, forced)
+        val add = SmsReader.toTxns(msgs, cards, 0L, Long.MAX_VALUE, startId, forced, rules)
         val sorted = (txns + add).sortedBy { it.time }
         txns.clear(); txns.addAll(sorted)
         loaded = true
@@ -207,6 +208,19 @@ fun App(onBg: (Long) -> Unit, shared: String?, onSharedUsed: () -> Unit) {
             else "${add.size}건 넣었어요" + if (msgs.size > add.size) " (못 읽은 문자 ${msgs.size - add.size}통)" else "",
             Toast.LENGTH_LONG
         ).show()
+    }
+
+    /** 확인 필요 건 결정: 같은 가맹점(또는 같은 유형 전체)에 적용하고 기억 */
+    fun decide(t: Txn, d: Int, wholeKind: Boolean) {
+        val m = rules.toMutableMap()
+        m[t.ruleKey] = d
+        if (wholeKind) m[t.kindKey] = d
+        rules = m; Store.saveRules(ctx, m)
+        for (i in txns.indices) {
+            val x = txns[i]
+            if (x.kind.isEmpty() || x.card != t.card || x.kind != t.kind) continue
+            if (x.id == t.id || x.ruleKey == t.ruleKey || (wholeKind && x.decision == 0)) txns[i] = x.copy(decision = d)
+        }
     }
 
     var pendingLoad by remember { mutableStateOf(false) }
@@ -240,6 +254,7 @@ fun App(onBg: (Long) -> Unit, shared: String?, onSharedUsed: () -> Unit) {
             onExtras = { screen = Screen.EXTRAS },
             onSettle = { screen = Screen.SETTLE },
             onPaste = { pasteText = "" },
+            onDecide = { t, d, all -> decide(t, d, all) },
         )
 
         Screen.SETTINGS -> SettingsScreen(
@@ -248,6 +263,10 @@ fun App(onBg: (Long) -> Unit, shared: String?, onSharedUsed: () -> Unit) {
             askPerm = { pendingLoad = false; permLauncher.launch(Manifest.permission.READ_SMS) },
             onBg = onBg,
             onDiag = { screen = Screen.DIAG },
+            onClearRules = {
+                rules = emptyMap(); Store.saveRules(ctx, emptyMap())
+                Toast.makeText(ctx, "확인 기억을 지웠어요", Toast.LENGTH_SHORT).show()
+            },
             onSave = {
                 val changed = it != cards
                 cards = it; Store.saveCards(ctx, it); screen = Screen.MAIN
@@ -373,6 +392,7 @@ fun MainScreen(
     mode: Int, from: Long, to: Long, loading: Boolean, loaded: Boolean,
     onMode: (Int) -> Unit, onFrom: (Long) -> Unit, onTo: (Long) -> Unit, onReload: () -> Unit,
     onSettings: () -> Unit, onExtras: () -> Unit, onSettle: () -> Unit, onPaste: () -> Unit,
+    onDecide: (Txn, Int, Boolean) -> Unit,
 ) {
     val ctx = LocalContext.current
     val pal = LocalPal.current
@@ -382,7 +402,10 @@ fun MainScreen(
     var editing by remember { mutableStateOf<Txn?>(null) }
     var addingCard by remember { mutableStateOf<String?>(null) }
 
-    val visible = txns.filter { tx -> cards.any { it.id == tx.card } }
+    val mine = txns.filter { tx -> cards.any { it.id == tx.card } }
+    val visible = mine.filter { it.shown }
+    val pending = mine.filter { it.needsCheck }
+    var checking by remember { mutableStateOf(false) }
     val shortOf = allCards.associate { it.id to it.short }
     val extraSum = extras.sumOf { it.totalIn(from, to) }
     val extraCount = extras.count { it.countIn(from, to) > 0 }
@@ -414,6 +437,26 @@ fun MainScreen(
                     Spacer(Modifier.width(8.dp))
                     CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp)
                 }
+            }
+        }
+
+        // 확인 필요
+        if (pending.isNotEmpty()) {
+            Row(
+                Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp)
+                    .background(pal.red.copy(alpha = 0.12f), RoundedCornerShape(10.dp))
+                    .clickable { checking = true }
+                    .padding(horizontal = 14.dp, vertical = 10.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column(Modifier.weight(1f)) {
+                    Text("확인 필요 ${pending.size}건", color = pal.red, fontWeight = FontWeight.Bold)
+                    Text(
+                        pending.map { it.kind }.distinct().joinToString(", ") + " — 결제로 넣을지 정해 주세요",
+                        color = pal.sub, fontSize = 13.sp, maxLines = 1, overflow = TextOverflow.Ellipsis
+                    )
+                }
+                Text("확인 〉", color = pal.red, fontWeight = FontWeight.SemiBold)
             }
         }
 
@@ -506,6 +549,16 @@ fun MainScreen(
         }
     }
 
+    if (checking) {
+        val t = pending.firstOrNull()
+        if (t == null) checking = false
+        else CheckDialog(
+            t = t, cardName = allCards.firstOrNull { it.id == t.card }?.name ?: "", left = pending.size,
+            onDecide = { d, all -> onDecide(t, d, all) },
+            onDismiss = { checking = false },
+        )
+    }
+
     editing?.let { t ->
         EditDialog(
             title = "내역 고치기", init = t,
@@ -555,6 +608,7 @@ fun TxnRow(t: Txn, tag: String, onToggle: (Boolean) -> Unit, onClick: () -> Unit
             val tags = buildList {
                 if (tag.isNotBlank()) add(tag)
                 add(rowTime(t.time))
+                if (t.kind.isNotEmpty()) add(t.kind)
                 if (t.cancel) add("취소")
                 if (t.installment.isNotBlank() && t.installment != "일시불") add(t.installment)
                 if (!t.parsed) add("금액 확인 필요")
@@ -568,6 +622,47 @@ fun TxnRow(t: Txn, tag: String, onToggle: (Boolean) -> Unit, onClick: () -> Unit
             modifier = Modifier.padding(end = 10.dp)
         )
     }
+}
+
+@Composable
+fun CheckDialog(t: Txn, cardName: String, left: Int, onDecide: (Int, Boolean) -> Unit, onDismiss: () -> Unit) {
+    val pal = LocalPal.current
+    var all by remember(t.id) { mutableStateOf(false) }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor = pal.bg,
+        title = { Text("확인 필요 · ${t.kind}") },
+        text = {
+            Column(Modifier.verticalScroll(rememberScrollState())) {
+                Text("$cardName · ${dayText(t.time)}", color = pal.sub, fontSize = 13.sp)
+                Spacer(Modifier.height(4.dp))
+                Text(t.merchant.ifBlank { t.kind }, fontSize = 18.sp, fontWeight = FontWeight.SemiBold)
+                Text(won(t.signed), fontSize = 22.sp, fontWeight = FontWeight.Bold, color = pal.accent)
+                Spacer(Modifier.height(10.dp))
+                Text(
+                    t.raw, fontSize = 13.sp, color = pal.sub,
+                    modifier = Modifier.fillMaxWidth().background(pal.soft, RoundedCornerShape(8.dp)).padding(10.dp)
+                )
+                Spacer(Modifier.height(6.dp))
+                Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.clickable { all = !all }) {
+                    Checkbox(all, { all = it })
+                    Text("앞으로 $cardName '${t.kind}'는 모두 이렇게", fontSize = 14.sp)
+                }
+                Text(
+                    "선택은 기억돼서 같은 ${if (t.merchant.isNotBlank()) "'${t.merchant}'" else "내용"} 문자는 다음부터 자동으로 처리돼요." +
+                            if (left > 1) "  (남은 확인 ${left - 1}건)" else "",
+                    color = pal.sub, fontSize = 12.sp
+                )
+            }
+        },
+        confirmButton = { Button(onClick = { onDecide(1, all) }) { Text("결제로 넣기") } },
+        dismissButton = {
+            Row {
+                TextButton(onClick = { onDecide(-1, all) }) { Text("무시", color = pal.red) }
+                TextButton(onClick = onDismiss) { Text("나중에") }
+            }
+        }
+    )
 }
 
 @Composable
@@ -673,8 +768,11 @@ fun SettleScreen(
             OutlinedTextField(
                 value = text, onValueChange = { text = it },
                 modifier = Modifier.fillMaxWidth().weight(1f),
-                textStyle = TextStyle(fontSize = 13.sp, fontFamily = FontFamily.Monospace, color = pal.text),
+                textStyle = TextStyle(fontSize = 15.sp, lineHeight = 22.sp, color = pal.text),
             )
+            val waiting = txns.count { it.needsCheck }
+            if (waiting > 0) Text("확인 필요 ${waiting}건은 아직 빠져 있어요. 메인 화면에서 정해 주세요.",
+                color = pal.red, fontSize = 12.sp, modifier = Modifier.padding(top = 4.dp))
             Text("글은 직접 고쳐도 돼요. 저장·보내기는 고친 글 그대로 나가요.", color = pal.sub, fontSize = 12.sp,
                 modifier = Modifier.padding(top = 4.dp))
         }
@@ -864,7 +962,8 @@ fun monthsBetween(a: Int, b: Int): Int = ((b / 100) * 12 + b % 100) - ((a / 100)
 @Composable
 fun SettingsScreen(
     cards: List<CardConf>, hasPerm: () -> Boolean, askPerm: () -> Unit,
-    onBg: (Long) -> Unit, onDiag: () -> Unit, onSave: (List<CardConf>) -> Unit, onBack: () -> Unit,
+    onBg: (Long) -> Unit, onDiag: () -> Unit, onClearRules: () -> Unit,
+    onSave: (List<CardConf>) -> Unit, onBack: () -> Unit,
 ) {
     val ctx = LocalContext.current
     val pal = LocalPal.current
@@ -947,6 +1046,9 @@ fun SettingsScreen(
             Spacer(Modifier.height(12.dp))
             OutlinedButton(onClick = { onSave(build()); onDiag() }, modifier = Modifier.fillMaxWidth()) {
                 Text("문자 진단 (못 읽을 때)")
+            }
+            OutlinedButton(onClick = onClearRules, modifier = Modifier.fillMaxWidth()) {
+                Text("확인 필요 선택 기억 지우기")
             }
 
             Spacer(Modifier.height(24.dp))
