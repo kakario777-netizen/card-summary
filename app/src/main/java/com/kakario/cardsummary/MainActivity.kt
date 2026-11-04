@@ -70,11 +70,26 @@ fun palOf(bg: Color): Pal {
 
 val LocalPal = staticCompositionLocalOf { palOf(Color.White) }
 
-enum class Screen { MAIN, SETTINGS, SETTLE, EXTRAS }
+enum class Screen { MAIN, SETTINGS, SETTLE, EXTRAS, DIAG }
 
 class MainActivity : ComponentActivity() {
+    /** 문자 앱에서 '공유'로 넘어온 글 */
+    val shared = mutableStateOf<String?>(null)
+
+    private fun takeShared(i: Intent?) {
+        if (i?.action == Intent.ACTION_SEND) {
+            i.getStringExtra(Intent.EXTRA_TEXT)?.let { if (it.isNotBlank()) shared.value = it }
+        }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        takeShared(intent)
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        takeShared(intent)
         setContent {
             val ctx = LocalContext.current
             var bg by remember { mutableLongStateOf(Store.bgColor(ctx)) }
@@ -99,7 +114,11 @@ class MainActivity : ComponentActivity() {
                         Modifier.fillMaxSize().systemBarsPadding().imePadding(),
                         color = pal.bg, contentColor = pal.text
                     ) {
-                        App(onBg = { bg = it; Store.saveBg(ctx, it) })
+                        App(
+                            onBg = { bg = it; Store.saveBg(ctx, it) },
+                            shared = shared.value,
+                            onSharedUsed = { shared.value = null },
+                        )
                     }
                 }
             }
@@ -140,7 +159,7 @@ fun pickDate(ctx: Context, init: Long, onPick: (Long) -> Unit) {
 /* ---------- 앱 ---------- */
 
 @Composable
-fun App(onBg: (Long) -> Unit) {
+fun App(onBg: (Long) -> Unit, shared: String?, onSharedUsed: () -> Unit) {
     val ctx = LocalContext.current
     val scope = rememberCoroutineScope()
 
@@ -170,6 +189,24 @@ fun App(onBg: (Long) -> Unit) {
             txns.clear(); txns.addAll(list)
             loading = false; loaded = true
         }
+    }
+
+    var pasteText by remember { mutableStateOf<String?>(null) }
+    LaunchedEffect(shared) { if (shared != null) { pasteText = shared; onSharedUsed(); screen = Screen.MAIN } }
+
+    fun addPasted(text: String, forced: String?) {
+        val msgs = SmsReader.splitPasted(text)
+        val startId = (txns.maxOfOrNull { it.id } ?: 0) + 1
+        val add = SmsReader.toTxns(msgs, cards, 0L, Long.MAX_VALUE, startId, forced)
+        val sorted = (txns + add).sortedBy { it.time }
+        txns.clear(); txns.addAll(sorted)
+        loaded = true
+        Toast.makeText(
+            ctx,
+            if (add.isEmpty()) "결제 문자를 찾지 못했어요. 카드를 직접 골라 다시 넣어 보세요."
+            else "${add.size}건 넣었어요" + if (msgs.size > add.size) " (못 읽은 문자 ${msgs.size - add.size}통)" else "",
+            Toast.LENGTH_LONG
+        ).show()
     }
 
     var pendingLoad by remember { mutableStateOf(false) }
@@ -202,6 +239,7 @@ fun App(onBg: (Long) -> Unit) {
             onSettings = { screen = Screen.SETTINGS },
             onExtras = { screen = Screen.EXTRAS },
             onSettle = { screen = Screen.SETTLE },
+            onPaste = { pasteText = "" },
         )
 
         Screen.SETTINGS -> SettingsScreen(
@@ -209,6 +247,7 @@ fun App(onBg: (Long) -> Unit) {
             hasPerm = { hasPerm() },
             askPerm = { pendingLoad = false; permLauncher.launch(Manifest.permission.READ_SMS) },
             onBg = onBg,
+            onDiag = { screen = Screen.DIAG },
             onSave = {
                 val changed = it != cards
                 cards = it; Store.saveCards(ctx, it); screen = Screen.MAIN
@@ -216,6 +255,8 @@ fun App(onBg: (Long) -> Unit) {
             },
             onBack = { screen = Screen.MAIN },
         )
+
+        Screen.DIAG -> DiagScreen(cards = cards, onBack = { screen = Screen.SETTINGS })
 
         Screen.EXTRAS -> ExtrasScreen(
             extras = extras, from = from, to = to,
@@ -227,6 +268,69 @@ fun App(onBg: (Long) -> Unit) {
             cards = cards.filter { it.enabled }, txns = txns.filter { tx -> cards.any { it.id == tx.card && it.enabled } },
             extras = extras, from = from, to = to,
             onBack = { screen = Screen.MAIN },
+        )
+    }
+
+    pasteText?.let { init ->
+        PasteDialog(
+            init = init, cards = cards.filter { it.enabled },
+            onDismiss = { pasteText = null },
+            onAdd = { text, forced -> addPasted(text, forced); pasteText = null },
+        )
+    }
+}
+
+@Composable
+fun PasteDialog(init: String, cards: List<CardConf>, onDismiss: () -> Unit, onAdd: (String, String?) -> Unit) {
+    val pal = LocalPal.current
+    var text by remember { mutableStateOf(init) }
+    var forced by remember { mutableStateOf<String?>(null) }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor = pal.bg,
+        title = { Text("문자 붙여넣기") },
+        text = {
+            Column {
+                Text("결제 문자를 복사해 붙여넣으세요. 여러 통도 한 번에 돼요.", color = pal.sub, fontSize = 13.sp)
+                Spacer(Modifier.height(8.dp))
+                OutlinedTextField(
+                    text, { text = it }, modifier = Modifier.fillMaxWidth().heightIn(min = 140.dp, max = 260.dp),
+                    textStyle = TextStyle(fontSize = 13.sp, color = pal.text)
+                )
+                Spacer(Modifier.height(8.dp))
+                Text("카드", color = pal.sub, fontSize = 13.sp)
+                Row(horizontalArrangement = Arrangement.spacedBy(6.dp), modifier = Modifier.padding(top = 4.dp)) {
+                    Chip("자동", forced == null) { forced = null }
+                    cards.forEach { c -> Chip(c.short, forced == c.id) { forced = c.id } }
+                }
+            }
+        },
+        confirmButton = { TextButton(onClick = { onAdd(text, forced) }, enabled = text.isNotBlank()) { Text("넣기") } },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("닫기") } }
+    )
+}
+
+@Composable
+fun DiagScreen(cards: List<CardConf>, onBack: () -> Unit) {
+    val ctx = LocalContext.current
+    val pal = LocalPal.current
+    var report by remember { mutableStateOf("검사 중...") }
+    LaunchedEffect(Unit) {
+        report = withContext(Dispatchers.IO) {
+            try { SmsReader.diagnose(ctx, cards) } catch (e: Exception) { "검사 실패: ${e.javaClass.simpleName} ${e.message}" }
+        }
+    }
+    Column(Modifier.fillMaxSize()) {
+        TopBar("문자 진단", onBack) {
+            TextButton(onClick = {
+                val cm = ctx.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                cm.setPrimaryClip(ClipData.newPlainText("진단", report))
+                Toast.makeText(ctx, "복사했어요", Toast.LENGTH_SHORT).show()
+            }) { Text("복사", color = pal.accent) }
+        }
+        Text(
+            report, fontSize = 13.sp, fontFamily = FontFamily.Monospace,
+            modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp)
         )
     }
 }
@@ -268,7 +372,7 @@ fun MainScreen(
     cards: List<CardConf>, allCards: List<CardConf>, txns: MutableList<Txn>, extras: List<Extra>,
     mode: Int, from: Long, to: Long, loading: Boolean, loaded: Boolean,
     onMode: (Int) -> Unit, onFrom: (Long) -> Unit, onTo: (Long) -> Unit, onReload: () -> Unit,
-    onSettings: () -> Unit, onExtras: () -> Unit, onSettle: () -> Unit,
+    onSettings: () -> Unit, onExtras: () -> Unit, onSettle: () -> Unit, onPaste: () -> Unit,
 ) {
     val ctx = LocalContext.current
     val pal = LocalPal.current
@@ -286,7 +390,8 @@ fun MainScreen(
 
     Column(Modifier.fillMaxSize()) {
         TopBar("카드 정리") {
-            TextButton(onClick = onReload, enabled = !loading) { Text("새로고침", color = pal.accent) }
+            TextButton(onClick = onPaste, contentPadding = PaddingValues(6.dp)) { Text("붙여넣기", color = pal.accent) }
+            TextButton(onClick = onReload, enabled = !loading, contentPadding = PaddingValues(6.dp)) { Text("새로고침", color = pal.accent) }
             TextButton(onClick = onSettings) { Text("설정", color = pal.accent) }
         }
 
@@ -344,7 +449,7 @@ fun MainScreen(
                 if (list.isEmpty()) item {
                     Text(
                         if (!loaded) "문자를 불러오는 중이에요."
-                        else "이 기간에 읽힌 결제 문자가 없어요.\n설정에서 문자 번호를 확인해 보세요.",
+                        else "이 기간에 읽힌 결제 문자가 없어요.\n설정 → 문자 진단에서 원인을 볼 수 있어요.\n위의 '붙여넣기'로 직접 넣을 수도 있어요.",
                         color = pal.sub, modifier = Modifier.padding(20.dp)
                     )
                 }
@@ -759,7 +864,7 @@ fun monthsBetween(a: Int, b: Int): Int = ((b / 100) * 12 + b % 100) - ((a / 100)
 @Composable
 fun SettingsScreen(
     cards: List<CardConf>, hasPerm: () -> Boolean, askPerm: () -> Unit,
-    onBg: (Long) -> Unit, onSave: (List<CardConf>) -> Unit, onBack: () -> Unit,
+    onBg: (Long) -> Unit, onDiag: () -> Unit, onSave: (List<CardConf>) -> Unit, onBack: () -> Unit,
 ) {
     val ctx = LocalContext.current
     val pal = LocalPal.current
@@ -837,6 +942,11 @@ fun SettingsScreen(
                         }
                     }
                 }
+            }
+
+            Spacer(Modifier.height(12.dp))
+            OutlinedButton(onClick = { onSave(build()); onDiag() }, modifier = Modifier.fillMaxWidth()) {
+                Text("문자 진단 (못 읽을 때)")
             }
 
             Spacer(Modifier.height(24.dp))
