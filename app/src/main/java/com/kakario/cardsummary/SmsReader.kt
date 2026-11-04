@@ -35,8 +35,50 @@ object SmsReader {
         val r0 = readRaw(ctx, from, to)
         val r = ReadResult()
         r.status.putAll(r0.status)
-        r0.msgs.forEach { r.msgs.add(it.copy(body = SmsParser.normalize(it.body).trim())) }
+        r0.msgs.forEach { r.msgs.add(it.copy(body = cleanBody(it.body))) }
         return r
+    }
+
+    /** 채팅+ 카드형 메시지(JSON)면 글만 뽑고, 줄바꿈 정리 */
+    fun cleanBody(body: String): String {
+        val rich = richText(body)
+        return SmsParser.normalize(rich ?: body).trim()
+    }
+
+    /**
+     * 채팅+ 카드형 메시지: {"messageHeader":"[Web발신]", ..., "layout":{"widget":"LinearLayout","children":[...]}}
+     * 화면에 보이는 글("text")만 순서대로 모음. 버튼 글자(채팅상담하기 등)는 뺌.
+     */
+    fun richText(body: String): String? {
+        val t = body.trim()
+        if (!t.startsWith("{") || !t.contains("\"widget\"")) return null
+        return try {
+            val out = ArrayList<String>()
+            fun walk(v: Any?) {
+                when (v) {
+                    is org.json.JSONObject -> {
+                        if (v.optString("widget") == "Button") return
+                        val txt = v.opt("text")
+                        if (txt is String && txt.isNotBlank()) out.add(txt.trim())
+                        val keys = v.keys()
+                        while (keys.hasNext()) {
+                            val k = keys.next()
+                            val c = v.opt(k)
+                            if (c is org.json.JSONObject || c is org.json.JSONArray) walk(c)
+                        }
+                    }
+                    is org.json.JSONArray -> for (i in 0 until v.length()) walk(v.opt(i))
+                }
+            }
+            walk(org.json.JSONObject(t))
+            if (out.isEmpty()) null else out.joinToString("\n")
+        } catch (_: Exception) {
+            // 형식이 깨졌으면 "text":"..." 만 순서대로 뽑기
+            val m = Regex("\"text\"\\s*:\\s*\"((?:\\\\.|[^\"\\\\])*)\"").findAll(t)
+                .map { it.groupValues[1].replace("\\n", "\n").replace("\\\"", "\"").replace("\\/", "/") }
+                .filter { it.isNotBlank() }.toList()
+            if (m.isEmpty()) null else m.joinToString("\n")
+        }
     }
 
     private fun readRaw(ctx: Context, from: Long, to: Long): ReadResult {
@@ -282,6 +324,6 @@ object SmsReader {
             // 한 줄짜리 결제 문자가 줄줄이 붙어 있으면 줄마다 나눔
             if (lines.size > 1 && lines.all { SmsParser.looksLikePayment(it) }) out.addAll(lines) else out.add(p)
         }
-        return out.map { Msg("", it, now, "붙여넣기") }
+        return out.map { Msg("", cleanBody(it), now, "붙여넣기") }
     }
 }
