@@ -102,8 +102,7 @@ object SmsReader {
         val seen = HashSet<String>()
         var id = 1L
         for (m in msgs) {
-            val card = cards.indexOfFirst { matches(m.address, it.numbers) }
-            if (card < 0) continue
+            val card = cards.firstOrNull { it.enabled && matches(m.address, it.numbers) }?.id ?: continue
             if (!SmsParser.looksLikePayment(m.body)) continue
             val r = SmsParser.parse(m.body, m.time)
             if (r.time < from || r.time > to) continue

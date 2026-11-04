@@ -1,7 +1,10 @@
 package com.kakario.cardsummary
 
 import android.Manifest
+import android.app.Activity
 import android.app.DatePickerDialog
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -13,11 +16,15 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.pager.HorizontalPager
+import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
@@ -26,37 +33,74 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.luminance
+import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
+import androidx.core.view.WindowCompat
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.util.Calendar
 
-private val Navy = Color(0xFF1F4E79)
-private val Red = Color(0xFFC0392B)
-private val Gray = Color(0xFF777777)
-private val Line = Color(0xFFE6E6E6)
-private val Soft = Color(0xFFF4F7FA)
+/* ---------- 색 ---------- */
 
-enum class Screen { HOME, SETTINGS, REVIEW, DONE }
+data class Pal(
+    val bg: Color, val text: Color, val sub: Color, val soft: Color,
+    val line: Color, val accent: Color, val red: Color, val dark: Boolean,
+)
+
+fun palOf(bg: Color): Pal {
+    val dark = bg.luminance() < 0.4f
+    return if (dark) Pal(
+        bg, Color(0xFFECECEC), Color(0xFF9A9A9A), Color(0x1FFFFFFF),
+        Color(0x26FFFFFF), Color(0xFF7FB3E0), Color(0xFFFF7B6E), true
+    ) else Pal(
+        bg, Color(0xFF111111), Color(0xFF777777), Color(0x0F1F4E79),
+        Color(0x1A000000), Color(0xFF1F4E79), Color(0xFFC0392B), false
+    )
+}
+
+val LocalPal = staticCompositionLocalOf { palOf(Color.White) }
+
+enum class Screen { MAIN, SETTINGS, SETTLE, EXTRAS }
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContent {
-            MaterialTheme(
-                colorScheme = lightColorScheme(
-                    primary = Navy, background = Color.White, surface = Color.White
-                )
-            ) {
-                Surface(Modifier.fillMaxSize().systemBarsPadding().imePadding(), color = Color.White) {
-                    App()
+            val ctx = LocalContext.current
+            var bg by remember { mutableLongStateOf(Store.bgColor(ctx)) }
+            val pal = palOf(Color(bg.toInt()))
+            SideEffect {
+                val w = (ctx as Activity).window
+                w.statusBarColor = pal.bg.toArgb()
+                w.navigationBarColor = pal.bg.toArgb()
+                val c = WindowCompat.getInsetsController(w, w.decorView)
+                c.isAppearanceLightStatusBars = !pal.dark
+                c.isAppearanceLightNavigationBars = !pal.dark
+            }
+            val scheme = if (pal.dark)
+                darkColorScheme(primary = pal.accent, background = pal.bg, surface = pal.bg,
+                    onBackground = pal.text, onSurface = pal.text)
+            else
+                lightColorScheme(primary = pal.accent, background = pal.bg, surface = pal.bg,
+                    onBackground = pal.text, onSurface = pal.text)
+            MaterialTheme(colorScheme = scheme) {
+                CompositionLocalProvider(LocalPal provides pal) {
+                    Surface(
+                        Modifier.fillMaxSize().systemBarsPadding().imePadding(),
+                        color = pal.bg, contentColor = pal.text
+                    ) {
+                        App(onBg = { bg = it; Store.saveBg(ctx, it) })
+                    }
                 }
             }
         }
@@ -96,106 +140,93 @@ fun pickDate(ctx: Context, init: Long, onPick: (Long) -> Unit) {
 /* ---------- 앱 ---------- */
 
 @Composable
-fun App() {
+fun App(onBg: (Long) -> Unit) {
     val ctx = LocalContext.current
     val scope = rememberCoroutineScope()
 
-    var screen by remember { mutableStateOf(Screen.HOME) }
-    var cards by remember { mutableStateOf(Store.load(ctx)) }
+    var screen by remember { mutableStateOf(Screen.MAIN) }
+    var cards by remember { mutableStateOf(Store.loadCards(ctx)) }
+    var extras by remember { mutableStateOf(Store.loadExtras(ctx)) }
     var mode by remember { mutableIntStateOf(0) }          // 0 이번 달, 1 지난달, 2 직접
     var from by remember { mutableLongStateOf(monthRange(0).first) }
     var to by remember { mutableLongStateOf(monthRange(0).second) }
     val txns = remember { mutableStateListOf<Txn>() }
     var loading by remember { mutableStateOf(false) }
-    var lastSummary by remember { mutableStateOf(Store.lastSummary(ctx)) }
-    var savedNote by remember { mutableStateOf("") }
-    var pendingLoad by remember { mutableStateOf(false) }
+    var loaded by remember { mutableStateOf(false) }
 
     fun hasPerm() = ContextCompat.checkSelfPermission(ctx, Manifest.permission.READ_SMS) ==
             PackageManager.PERMISSION_GRANTED
 
     fun load() {
         loading = true
+        val cs = cards; val f = from; val t = to
         scope.launch {
             val list = try {
-                withContext(Dispatchers.IO) { SmsReader.collect(ctx, cards, from, to) }
+                withContext(Dispatchers.IO) { SmsReader.collect(ctx, cs, f, t) }
             } catch (e: Exception) {
                 Toast.makeText(ctx, "문자를 읽지 못했어요: ${e.message}", Toast.LENGTH_LONG).show()
                 emptyList()
             }
             txns.clear(); txns.addAll(list)
-            loading = false
-            screen = Screen.REVIEW
+            loading = false; loaded = true
         }
     }
 
+    var pendingLoad by remember { mutableStateOf(false) }
     val permLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { ok ->
         val go = pendingLoad
         pendingLoad = false
         if (ok) { if (go) load() } else Toast.makeText(ctx, "문자 읽기 권한이 있어야 정리할 수 있어요", Toast.LENGTH_LONG).show()
     }
 
-    BackHandler(enabled = screen != Screen.HOME) {
-        screen = if (screen == Screen.DONE) Screen.REVIEW else Screen.HOME
+    fun loadOrAsk() {
+        if (hasPerm()) load() else { pendingLoad = true; permLauncher.launch(Manifest.permission.READ_SMS) }
     }
 
+    // 처음 켤 때 자동으로 불러오기
+    LaunchedEffect(Unit) { loadOrAsk() }
+
+    BackHandler(enabled = screen != Screen.MAIN) { screen = Screen.MAIN }
+
     when (screen) {
-        Screen.HOME -> HomeScreen(
-            cards = cards, mode = mode, from = from, to = to, loading = loading,
-            lastSummary = lastSummary,
+        Screen.MAIN -> MainScreen(
+            cards = cards.filter { it.enabled }, allCards = cards, txns = txns, extras = extras,
+            mode = mode, from = from, to = to, loading = loading, loaded = loaded,
             onMode = { m ->
                 mode = m
-                if (m < 2) { val r = monthRange(-m); from = r.first; to = r.second }
+                if (m < 2) { val r = monthRange(-m); from = r.first; to = r.second; loadOrAsk() }
             },
-            onFrom = { from = startOfDay(it); mode = 2 },
-            onTo = { to = endOfDay(it); mode = 2 },
-            onStart = {
-                if (hasPerm()) load()
-                else { pendingLoad = true; permLauncher.launch(Manifest.permission.READ_SMS) }
-            },
+            onFrom = { from = startOfDay(it); mode = 2; loadOrAsk() },
+            onTo = { to = endOfDay(it); mode = 2; loadOrAsk() },
+            onReload = { loadOrAsk() },
             onSettings = { screen = Screen.SETTINGS },
+            onExtras = { screen = Screen.EXTRAS },
+            onSettle = { screen = Screen.SETTLE },
         )
 
         Screen.SETTINGS -> SettingsScreen(
             cards = cards,
             hasPerm = { hasPerm() },
             askPerm = { pendingLoad = false; permLauncher.launch(Manifest.permission.READ_SMS) },
-            onSave = { cards = it; Store.save(ctx, it); screen = Screen.HOME },
-            onBack = { screen = Screen.HOME },
+            onBg = onBg,
+            onSave = {
+                val changed = it != cards
+                cards = it; Store.saveCards(ctx, it); screen = Screen.MAIN
+                if (changed) loadOrAsk()
+            },
+            onBack = { screen = Screen.MAIN },
         )
 
-        Screen.REVIEW -> ReviewScreen(
-            cards = cards, txns = txns, from = from, to = to,
-            onBack = { screen = Screen.HOME },
-            onConfirm = {
-                val notes = ArrayList<String>()
-                cards.forEachIndexed { i, c ->
-                    val text = Exporter.memoText(c, txns.filter { it.card == i }, from, to)
-                    val name = Exporter.fileName(c, from, to)
-                    val uri = try { Exporter.saveToDownloads(ctx, name, text) } catch (_: Exception) { null }
-                    notes.add(if (uri != null) "다운로드/카드정리/$name" else "${c.name} 저장 실패")
-                }
-                savedNote = notes.joinToString("\n")
-                val total = txns.filter { it.include }.sumOf { it.signed }
-                lastSummary = "${dayText(from)} ~ ${dayText(to)}  총 ${won(total)}"
-                Store.saveLastSummary(ctx, lastSummary)
-                screen = Screen.DONE
-            },
+        Screen.EXTRAS -> ExtrasScreen(
+            extras = extras, from = from, to = to,
+            onChange = { extras = it; Store.saveExtras(ctx, it) },
+            onBack = { screen = Screen.MAIN },
         )
 
-        Screen.DONE -> DoneScreen(
-            cards = cards, txns = txns, from = from, to = to, savedNote = savedNote,
-            onShare = { i ->
-                val text = Exporter.memoText(cards[i], txns.filter { it.card == i }, from, to)
-                val send = Intent(Intent.ACTION_SEND).apply {
-                    type = "text/plain"
-                    putExtra(Intent.EXTRA_SUBJECT, Exporter.fileName(cards[i], from, to))
-                    putExtra(Intent.EXTRA_TEXT, text)
-                }
-                ctx.startActivity(Intent.createChooser(send, "${cards[i].name} 메모 보내기"))
-            },
-            onReview = { screen = Screen.REVIEW },
-            onHome = { screen = Screen.HOME },
+        Screen.SETTLE -> SettleScreen(
+            cards = cards.filter { it.enabled }, txns = txns.filter { tx -> cards.any { it.id == tx.card && it.enabled } },
+            extras = extras, from = from, to = to,
+            onBack = { screen = Screen.MAIN },
         )
     }
 }
@@ -204,241 +235,169 @@ fun App() {
 
 @Composable
 fun TopBar(title: String, onBack: (() -> Unit)? = null, right: @Composable () -> Unit = {}) {
+    val pal = LocalPal.current
     Row(
         Modifier.fillMaxWidth().height(56.dp).padding(horizontal = 8.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
-        if (onBack != null) TextButton(onClick = onBack) { Text("〈 뒤로", color = Navy) }
+        if (onBack != null) TextButton(onClick = onBack) { Text("〈 뒤로", color = pal.accent) }
         else Spacer(Modifier.width(12.dp))
         Text(title, fontSize = 20.sp, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
         right()
     }
-    HorizontalDivider(color = Line)
+    HorizontalDivider(color = pal.line)
 }
 
 @Composable
 fun Chip(text: String, selected: Boolean, onClick: () -> Unit) {
+    val pal = LocalPal.current
     Box(
         Modifier
-            .background(if (selected) Navy else Soft, RoundedCornerShape(20.dp))
+            .background(if (selected) pal.accent else pal.soft, RoundedCornerShape(20.dp))
             .clickable(onClick = onClick)
-            .padding(horizontal = 16.dp, vertical = 9.dp)
-    ) { Text(text, color = if (selected) Color.White else Color.Black, fontSize = 15.sp) }
+            .padding(horizontal = 14.dp, vertical = 8.dp)
+    ) {
+        Text(text, color = if (selected) (if (pal.dark) Color.Black else Color.White) else pal.text, fontSize = 14.sp)
+    }
 }
 
-/* ---------- 홈 ---------- */
+/* ---------- 메인 ---------- */
 
 @Composable
-fun HomeScreen(
-    cards: List<CardConf>, mode: Int, from: Long, to: Long, loading: Boolean, lastSummary: String,
-    onMode: (Int) -> Unit, onFrom: (Long) -> Unit, onTo: (Long) -> Unit,
-    onStart: () -> Unit, onSettings: () -> Unit,
+fun MainScreen(
+    cards: List<CardConf>, allCards: List<CardConf>, txns: MutableList<Txn>, extras: List<Extra>,
+    mode: Int, from: Long, to: Long, loading: Boolean, loaded: Boolean,
+    onMode: (Int) -> Unit, onFrom: (Long) -> Unit, onTo: (Long) -> Unit, onReload: () -> Unit,
+    onSettings: () -> Unit, onExtras: () -> Unit, onSettle: () -> Unit,
 ) {
     val ctx = LocalContext.current
+    val pal = LocalPal.current
+    val scope = rememberCoroutineScope()
+    val pageCount = cards.size + 1
+    val pager = rememberPagerState(pageCount = { pageCount })
+    var editing by remember { mutableStateOf<Txn?>(null) }
+    var addingCard by remember { mutableStateOf<String?>(null) }
+
+    val visible = txns.filter { tx -> cards.any { it.id == tx.card } }
+    val shortOf = allCards.associate { it.id to it.short }
+    val extraSum = extras.sumOf { it.totalIn(from, to) }
+    val extraCount = extras.count { it.countIn(from, to) > 0 }
+    val cardSum = visible.filter { it.include }.sumOf { it.signed }
+
     Column(Modifier.fillMaxSize()) {
-        TopBar("카드 정리") { TextButton(onClick = onSettings) { Text("번호 설정", color = Navy) } }
-        Column(Modifier.padding(20.dp).verticalScroll(rememberScrollState())) {
-            Text("기간", fontWeight = FontWeight.Bold, fontSize = 16.sp)
-            Spacer(Modifier.height(10.dp))
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        TopBar("카드 정리") {
+            TextButton(onClick = onReload, enabled = !loading) { Text("새로고침", color = pal.accent) }
+            TextButton(onClick = onSettings) { Text("설정", color = pal.accent) }
+        }
+
+        // 기간
+        Column(Modifier.padding(horizontal = 16.dp, vertical = 10.dp)) {
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
                 Chip("이번 달", mode == 0) { onMode(0) }
                 Chip("지난달", mode == 1) { onMode(1) }
-                Chip("직접 지정", mode == 2) { onMode(2) }
+                Chip("직접", mode == 2) { onMode(2) }
             }
-            Spacer(Modifier.height(14.dp))
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                OutlinedButton(onClick = { pickDate(ctx, from, onFrom) }) { Text(dayText(from)) }
-                Text("  ~  ")
-                OutlinedButton(onClick = { pickDate(ctx, to, onTo) }) { Text(dayText(to)) }
-            }
-
-            Spacer(Modifier.height(24.dp))
-            Text("등록된 카드", fontWeight = FontWeight.Bold, fontSize = 16.sp)
-            Spacer(Modifier.height(8.dp))
-            cards.forEach { c ->
-                Column(
-                    Modifier.fillMaxWidth().padding(vertical = 4.dp)
-                        .background(Soft, RoundedCornerShape(10.dp)).padding(14.dp)
-                ) {
-                    Text(c.name, fontWeight = FontWeight.SemiBold)
-                    Text(
-                        if (c.numbers.isEmpty()) "문자 번호 없음 — 번호 설정에서 등록해 주세요"
-                        else "문자 번호: " + c.numbers.joinToString(", "),
-                        color = Gray, fontSize = 13.sp
-                    )
+            Row(Modifier.padding(top = 6.dp), verticalAlignment = Alignment.CenterVertically) {
+                TextButton(onClick = { pickDate(ctx, from, onFrom) }, contentPadding = PaddingValues(4.dp)) {
+                    Text(dayText(from), color = pal.text)
+                }
+                Text("~", color = pal.sub)
+                TextButton(onClick = { pickDate(ctx, to, onTo) }, contentPadding = PaddingValues(4.dp)) {
+                    Text(dayText(to), color = pal.text)
+                }
+                if (loading) {
+                    Spacer(Modifier.width(8.dp))
+                    CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp)
                 }
             }
-
-            Spacer(Modifier.height(24.dp))
-            Button(
-                onClick = onStart, enabled = !loading,
-                modifier = Modifier.fillMaxWidth().height(56.dp),
-                shape = RoundedCornerShape(12.dp)
-            ) {
-                if (loading) CircularProgressIndicator(Modifier.size(22.dp), color = Color.White, strokeWidth = 2.dp)
-                else Text("문자 불러와서 검토하기", fontSize = 17.sp)
-            }
-
-            if (lastSummary.isNotBlank()) {
-                Spacer(Modifier.height(20.dp))
-                Text("지난 정리", color = Gray, fontSize = 13.sp)
-                Text(lastSummary, fontSize = 15.sp)
-            }
-        }
-    }
-}
-
-/* ---------- 설정 ---------- */
-
-@Composable
-fun SettingsScreen(
-    cards: List<CardConf>, hasPerm: () -> Boolean, askPerm: () -> Unit,
-    onSave: (List<CardConf>) -> Unit, onBack: () -> Unit,
-) {
-    val ctx = LocalContext.current
-    val scope = rememberCoroutineScope()
-    val names = remember { mutableStateListOf(*cards.map { it.name }.toTypedArray()) }
-    val kws = remember { mutableStateListOf(*cards.map { it.keyword }.toTypedArray()) }
-    val nums = remember { mutableStateListOf(*cards.map { it.numbers.joinToString(", ") }.toTypedArray()) }
-    var found by remember { mutableStateOf<Pair<Int, List<Pair<String, Int>>>?>(null) }
-
-    fun build() = names.indices.map { i ->
-        CardConf(names[i], kws[i], nums[i].split(",").map { digits(it) }.filter { it.isNotEmpty() })
-    }
-
-    Column(Modifier.fillMaxSize()) {
-        TopBar("번호 설정", onBack) { TextButton(onClick = { onSave(build()) }) { Text("저장", color = Navy) } }
-        Column(Modifier.padding(20.dp).verticalScroll(rememberScrollState())) {
-            Text(
-                "카드사 결제 문자가 오는 번호를 적어 두면 그 번호 문자만 골라 정리해요. " +
-                        "번호를 모르면 '최근 문자에서 찾기'를 눌러 보세요.",
-                color = Gray, fontSize = 14.sp
-            )
-            for (i in names.indices) {
-                Spacer(Modifier.height(20.dp))
-                Text("카드 ${i + 1}", fontWeight = FontWeight.Bold)
-                OutlinedTextField(names[i], { names[i] = it }, label = { Text("카드 이름") },
-                    singleLine = true, modifier = Modifier.fillMaxWidth())
-                OutlinedTextField(nums[i], { nums[i] = it }, label = { Text("문자 번호 (여러 개는 쉼표로)") },
-                    singleLine = true, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Phone),
-                    modifier = Modifier.fillMaxWidth())
-                OutlinedTextField(kws[i], { kws[i] = it }, label = { Text("번호 찾기용 문자 속 단어") },
-                    singleLine = true, modifier = Modifier.fillMaxWidth())
-                Spacer(Modifier.height(6.dp))
-                OutlinedButton(onClick = {
-                    if (!hasPerm()) {
-                        askPerm()
-                    } else {
-                        val kw = kws[i]
-                        scope.launch {
-                            val r = withContext(Dispatchers.IO) {
-                                try { SmsReader.findSenders(ctx, kw) } catch (_: Exception) { emptyList() }
-                            }
-                            found = i to r
-                        }
-                    }
-                }) { Text("최근 문자에서 찾기") }
-            }
-        }
-    }
-
-    found?.let { (i, list) ->
-        AlertDialog(
-            onDismissRequest = { found = null },
-            title = { Text("${names[i]} 번호 후보") },
-            text = {
-                if (list.isEmpty()) Text("최근 90일 문자에서 '${kws[i]}' 결제 문자를 못 찾았어요.")
-                else Column {
-                    Text("눌러서 추가하세요", color = Gray, fontSize = 13.sp)
-                    list.take(8).forEach { (n, cnt) ->
-                        Text(
-                            "$n  (${cnt}건)",
-                            fontSize = 16.sp,
-                            modifier = Modifier.fillMaxWidth().clickable {
-                                val cur = nums[i].split(",").map { digits(it) }.filter { it.isNotEmpty() }
-                                if (n !in cur) nums[i] = (cur + n).joinToString(", ")
-                                found = null
-                            }.padding(vertical = 10.dp)
-                        )
-                    }
-                }
-            },
-            confirmButton = { TextButton(onClick = { found = null }) { Text("닫기") } }
-        )
-    }
-}
-
-/* ---------- 검토 ---------- */
-
-@Composable
-fun ReviewScreen(
-    cards: List<CardConf>, txns: MutableList<Txn>, from: Long, to: Long,
-    onBack: () -> Unit, onConfirm: () -> Unit,
-) {
-    var tab by remember { mutableIntStateOf(0) }
-    var editing by remember { mutableStateOf<Txn?>(null) }
-    var adding by remember { mutableStateOf(false) }
-
-    fun sumOf(card: Int) = txns.filter { it.card == card && it.include }.sumOf { it.signed }
-
-    Column(Modifier.fillMaxSize()) {
-        TopBar("검토", onBack)
-        Text("${dayText(from)} ~ ${dayText(to)}", color = Gray, fontSize = 13.sp,
-            modifier = Modifier.padding(start = 20.dp, top = 8.dp))
-
-        TabRow(selectedTabIndex = tab, containerColor = Color.White) {
-            cards.forEachIndexed { i, c ->
-                Tab(selected = tab == i, onClick = { tab = i }, text = {
-                    Text("${c.name} ${txns.count { it.card == i }}건")
-                })
-            }
         }
 
-        val list = txns.filter { it.card == tab }
-        Box(Modifier.weight(1f)) {
-            if (list.isEmpty()) {
-                Text(
-                    "이 기간에 읽힌 결제 문자가 없어요.\n번호 설정에서 문자 번호를 확인해 보세요.",
-                    color = Gray, modifier = Modifier.padding(24.dp)
+        // 탭
+        ScrollableTabRow(
+            selectedTabIndex = pager.currentPage.coerceIn(0, pageCount - 1),
+            containerColor = pal.bg, contentColor = pal.accent, edgePadding = 8.dp,
+            divider = { HorizontalDivider(color = pal.line) }
+        ) {
+            val titles = listOf("전체" to visible.size) + cards.map { c -> c.short to visible.count { it.card == c.id } }
+            titles.forEachIndexed { i, (name, n) ->
+                Tab(
+                    selected = pager.currentPage == i,
+                    onClick = { scope.launch { pager.animateScrollToPage(i) } },
+                    selectedContentColor = pal.accent, unselectedContentColor = pal.sub,
+                    text = { Text("$name $n", fontSize = 15.sp, fontWeight = FontWeight.SemiBold) }
                 )
             }
+        }
+
+        // 좌우 슬라이드
+        HorizontalPager(state = pager, modifier = Modifier.weight(1f), key = { it }) { page ->
+            val card = if (page == 0) null else cards.getOrNull(page - 1)
+            val list = if (card == null) visible else visible.filter { it.card == card.id }
+            val sum = list.filter { it.include }.sumOf { it.signed }
             LazyColumn(Modifier.fillMaxSize()) {
+                item {
+                    Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 10.dp)) {
+                        Text(card?.name ?: "전체 카드", color = pal.sub, modifier = Modifier.weight(1f))
+                        Text("${list.count { it.include }}건 · ${won(sum)}", color = pal.sub)
+                    }
+                }
+                if (list.isEmpty()) item {
+                    Text(
+                        if (!loaded) "문자를 불러오는 중이에요."
+                        else "이 기간에 읽힌 결제 문자가 없어요.\n설정에서 문자 번호를 확인해 보세요.",
+                        color = pal.sub, modifier = Modifier.padding(20.dp)
+                    )
+                }
                 items(list, key = { it.id }) { t ->
                     TxnRow(
-                        t,
+                        t, tag = if (card == null) shortOf[t.card] ?: "" else "",
                         onToggle = { v ->
                             val idx = txns.indexOfFirst { it.id == t.id }
                             if (idx >= 0) txns[idx] = t.copy(include = v)
                         },
                         onClick = { editing = t }
                     )
-                    HorizontalDivider(color = Line)
+                    HorizontalDivider(color = pal.line)
                 }
-                item {
-                    TextButton(onClick = { adding = true }, modifier = Modifier.padding(12.dp)) {
-                        Text("+ 직접 추가", color = Navy)
+                if (card != null) item {
+                    TextButton(onClick = { addingCard = card.id }, modifier = Modifier.padding(8.dp)) {
+                        Text("+ ${card.short} 직접 추가", color = pal.accent)
                     }
                 }
             }
         }
 
-        HorizontalDivider(color = Line)
-        Column(Modifier.fillMaxWidth().background(Soft).padding(16.dp)) {
-            cards.forEachIndexed { i, c ->
-                Row {
-                    Text(c.name, modifier = Modifier.weight(1f))
-                    Text(won(sumOf(i)))
-                }
+        // 기타 비용
+        HorizontalDivider(color = pal.line)
+        Row(
+            Modifier.fillMaxWidth().clickable(onClick = onExtras).padding(horizontal = 16.dp, vertical = 12.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Column(Modifier.weight(1f)) {
+                Text("기타 비용", fontWeight = FontWeight.SemiBold)
+                Text(
+                    if (extras.isEmpty()) "정산 때 같이 넣을 돈을 등록하세요"
+                    else "이 기간 ${extraCount}건 · 등록 ${extras.size}건",
+                    color = pal.sub, fontSize = 13.sp
+                )
             }
-            Row(Modifier.padding(top = 6.dp), verticalAlignment = Alignment.CenterVertically) {
-                Text("총합", fontWeight = FontWeight.Bold, fontSize = 18.sp, modifier = Modifier.weight(1f))
-                Text(won(cards.indices.sumOf { sumOf(it) }), fontWeight = FontWeight.Bold, fontSize = 20.sp, color = Navy)
+            Text(won(extraSum), fontWeight = FontWeight.SemiBold)
+            Text("  〉", color = pal.sub)
+        }
+
+        // 총금액 + 정산
+        HorizontalDivider(color = pal.line)
+        Row(
+            Modifier.fillMaxWidth().background(pal.soft).padding(16.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Column(Modifier.weight(1f)) {
+                Text("총금액", color = pal.sub, fontSize = 13.sp)
+                Text(won(cardSum + extraSum), fontWeight = FontWeight.Bold, fontSize = 22.sp, color = pal.accent)
             }
-            Spacer(Modifier.height(10.dp))
-            Button(
-                onClick = onConfirm, modifier = Modifier.fillMaxWidth().height(52.dp),
-                shape = RoundedCornerShape(12.dp)
-            ) { Text("확정하고 메모장 저장", fontSize = 16.sp) }
+            Button(onClick = onSettle, shape = RoundedCornerShape(12.dp), modifier = Modifier.height(50.dp)) {
+                Text("정산", fontSize = 17.sp)
+            }
         }
     }
 
@@ -458,26 +417,27 @@ fun ReviewScreen(
             }
         )
     }
-    if (adding) {
+    addingCard?.let { cid ->
         val nextId = (txns.maxOfOrNull { it.id } ?: 0) + 1
         EditDialog(
-            title = "${cards[tab].name} 직접 추가",
-            init = Txn(nextId, tab, minOf(System.currentTimeMillis(), to), "", 0, false, "", true, "", true),
-            onDismiss = { adding = false },
+            title = "${shortOf[cid]} 직접 추가",
+            init = Txn(nextId, cid, minOf(System.currentTimeMillis(), to), "", 0, false, "", true, "", true),
+            onDismiss = { addingCard = null },
             onDelete = null,
             onSave = { n ->
                 val sorted = (txns + n).sortedBy { it.time }
                 txns.clear(); txns.addAll(sorted)
-                adding = false
+                addingCard = null
             }
         )
     }
 }
 
 @Composable
-fun TxnRow(t: Txn, onToggle: (Boolean) -> Unit, onClick: () -> Unit) {
+fun TxnRow(t: Txn, tag: String, onToggle: (Boolean) -> Unit, onClick: () -> Unit) {
+    val pal = LocalPal.current
     Row(
-        Modifier.fillMaxWidth().clickable(onClick = onClick).padding(horizontal = 8.dp, vertical = 6.dp),
+        Modifier.fillMaxWidth().clickable(onClick = onClick).padding(horizontal = 6.dp, vertical = 4.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
         Checkbox(checked = t.include, onCheckedChange = onToggle)
@@ -485,21 +445,22 @@ fun TxnRow(t: Txn, onToggle: (Boolean) -> Unit, onClick: () -> Unit) {
             Text(
                 t.merchant.ifBlank { "(가맹점 없음)" },
                 maxLines = 1, overflow = TextOverflow.Ellipsis,
-                color = if (t.include) Color.Black else Gray, fontSize = 16.sp
+                color = if (t.include) pal.text else pal.sub, fontSize = 16.sp
             )
             val tags = buildList {
+                if (tag.isNotBlank()) add(tag)
                 add(rowTime(t.time))
                 if (t.cancel) add("취소")
                 if (t.installment.isNotBlank() && t.installment != "일시불") add(t.installment)
                 if (!t.parsed) add("금액 확인 필요")
             }
-            Text(tags.joinToString(" · "), color = if (!t.parsed) Red else Gray, fontSize = 13.sp)
+            Text(tags.joinToString(" · "), color = if (!t.parsed) pal.red else pal.sub, fontSize = 13.sp)
         }
         Text(
             won(t.signed),
-            color = when { !t.include -> Gray; t.cancel -> Red; else -> Color.Black },
+            color = when { !t.include -> pal.sub; t.cancel -> pal.red; else -> pal.text },
             fontWeight = FontWeight.SemiBold, fontSize = 16.sp,
-            modifier = Modifier.padding(end = 8.dp)
+            modifier = Modifier.padding(end = 10.dp)
         )
     }
 }
@@ -510,6 +471,7 @@ fun EditDialog(
     onDismiss: () -> Unit, onDelete: (() -> Unit)?, onSave: (Txn) -> Unit,
 ) {
     val ctx = LocalContext.current
+    val pal = LocalPal.current
     var merchant by remember { mutableStateOf(init.merchant) }
     var amount by remember { mutableStateOf(if (init.amount > 0) init.amount.toString() else "") }
     var cancel by remember { mutableStateOf(init.cancel) }
@@ -517,6 +479,7 @@ fun EditDialog(
 
     AlertDialog(
         onDismissRequest = onDismiss,
+        containerColor = pal.bg,
         title = { Text(title) },
         text = {
             Column(Modifier.verticalScroll(rememberScrollState())) {
@@ -539,10 +502,10 @@ fun EditDialog(
                 }) { Text("날짜: ${dayText(time)}") }
                 if (init.raw.isNotBlank()) {
                     Spacer(Modifier.height(10.dp))
-                    Text("원본 문자", color = Gray, fontSize = 12.sp)
+                    Text("원본 문자", color = pal.sub, fontSize = 12.sp)
                     Text(
                         init.raw, fontSize = 13.sp,
-                        modifier = Modifier.fillMaxWidth().background(Soft, RoundedCornerShape(8.dp)).padding(10.dp)
+                        modifier = Modifier.fillMaxWidth().background(pal.soft, RoundedCornerShape(8.dp)).padding(10.dp)
                     )
                 }
             }
@@ -556,55 +519,372 @@ fun EditDialog(
         },
         dismissButton = {
             Row {
-                if (onDelete != null) TextButton(onClick = onDelete) { Text("삭제", color = Red) }
+                if (onDelete != null) TextButton(onClick = onDelete) { Text("삭제", color = pal.red) }
                 TextButton(onClick = onDismiss) { Text("닫기") }
             }
         }
     )
 }
 
-/* ---------- 완료 ---------- */
+/* ---------- 정산 ---------- */
 
 @Composable
-fun DoneScreen(
-    cards: List<CardConf>, txns: List<Txn>, from: Long, to: Long, savedNote: String,
-    onShare: (Int) -> Unit, onReview: () -> Unit, onHome: () -> Unit,
+fun SettleScreen(
+    cards: List<CardConf>, txns: List<Txn>, extras: List<Extra>, from: Long, to: Long,
+    onBack: () -> Unit,
 ) {
+    val ctx = LocalContext.current
+    val pal = LocalPal.current
+    var mode by remember { mutableIntStateOf(Store.settleMode(ctx)) }
+    var withExtras by remember { mutableStateOf(true) }
+    var text by remember { mutableStateOf("") }
+
+    LaunchedEffect(mode, withExtras) {
+        text = Settle.build(mode, cards, txns, extras, withExtras, from, to)
+        Store.saveSettleMode(ctx, mode)
+    }
+    val total = Settle.total(txns, extras, withExtras, from, to)
+    val hasExtras = extras.any { it.countIn(from, to) > 0 }
+
     Column(Modifier.fillMaxSize()) {
-        TopBar("정리 완료")
-        Column(Modifier.padding(20.dp).verticalScroll(rememberScrollState())) {
-            Text("${dayText(from)} ~ ${dayText(to)}", color = Gray)
-            Spacer(Modifier.height(16.dp))
-            cards.forEachIndexed { i, c ->
-                val mine = txns.filter { it.card == i && it.include }
-                Column(
-                    Modifier.fillMaxWidth().padding(vertical = 5.dp)
-                        .background(Soft, RoundedCornerShape(12.dp)).padding(16.dp)
+        TopBar("정산", onBack)
+        Column(Modifier.weight(1f).padding(16.dp)) {
+            Text("정산 방식", fontWeight = FontWeight.SemiBold)
+            Spacer(Modifier.height(8.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Chip("날짜순 (카드 섞어서)", mode == Settle.BY_DATE) { mode = Settle.BY_DATE }
+                Chip("카드사별", mode == Settle.BY_CARD) { mode = Settle.BY_CARD }
+            }
+            if (hasExtras) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Checkbox(withExtras, { withExtras = it })
+                    Text("기타 비용 포함")
+                }
+            } else Spacer(Modifier.height(8.dp))
+            Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(vertical = 4.dp)) {
+                Text("총금액", color = pal.sub, modifier = Modifier.weight(1f))
+                Text(won(total), fontWeight = FontWeight.Bold, fontSize = 22.sp, color = pal.accent)
+            }
+            OutlinedTextField(
+                value = text, onValueChange = { text = it },
+                modifier = Modifier.fillMaxWidth().weight(1f),
+                textStyle = TextStyle(fontSize = 13.sp, fontFamily = FontFamily.Monospace, color = pal.text),
+            )
+            Text("글은 직접 고쳐도 돼요. 저장·보내기는 고친 글 그대로 나가요.", color = pal.sub, fontSize = 12.sp,
+                modifier = Modifier.padding(top = 4.dp))
+        }
+        Row(
+            Modifier.fillMaxWidth().background(pal.soft).padding(12.dp),
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            OutlinedButton(onClick = {
+                val cm = ctx.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                cm.setPrimaryClip(ClipData.newPlainText("정산", text))
+                Toast.makeText(ctx, "복사했어요", Toast.LENGTH_SHORT).show()
+            }, modifier = Modifier.weight(1f)) { Text("복사") }
+            OutlinedButton(onClick = {
+                val send = Intent(Intent.ACTION_SEND).apply {
+                    type = "text/plain"
+                    putExtra(Intent.EXTRA_SUBJECT, Settle.fileName(from, to))
+                    putExtra(Intent.EXTRA_TEXT, text)
+                }
+                ctx.startActivity(Intent.createChooser(send, "정산 보내기"))
+            }, modifier = Modifier.weight(1f)) { Text("보내기") }
+            Button(onClick = {
+                val name = Settle.fileName(from, to)
+                val uri = try { Exporter.saveToDownloads(ctx, name, text) } catch (_: Exception) { null }
+                Toast.makeText(
+                    ctx, if (uri != null) "다운로드/카드정리/$name 에 저장했어요" else "저장하지 못했어요",
+                    Toast.LENGTH_LONG
+                ).show()
+            }, modifier = Modifier.weight(1.3f)) { Text("메모장 저장") }
+        }
+    }
+}
+
+/* ---------- 기타 비용 ---------- */
+
+@Composable
+fun ExtrasScreen(
+    extras: List<Extra>, from: Long, to: Long,
+    onChange: (List<Extra>) -> Unit, onBack: () -> Unit,
+) {
+    val pal = LocalPal.current
+    var editing by remember { mutableStateOf<Extra?>(null) }
+
+    Column(Modifier.fillMaxSize()) {
+        TopBar("기타 비용", onBack) {
+            TextButton(onClick = {
+                editing = Extra((extras.maxOfOrNull { it.id } ?: 0) + 1, "", 0, ymOf(from), 0)
+            }) { Text("+ 추가", color = pal.accent) }
+        }
+        Text(
+            "정산할 때 카드 결제와 같이 넣을 돈이에요. 매월 / 몇 개월 / 한 번 / 원하는 기간으로 정할 수 있고, " +
+                    "고른 정산 기간에 해당하는 달만큼 들어가요.",
+            color = pal.sub, fontSize = 13.sp, modifier = Modifier.padding(16.dp)
+        )
+        LazyColumn(Modifier.weight(1f)) {
+            if (extras.isEmpty()) item {
+                Text("등록된 비용이 없어요. 오른쪽 위 '+ 추가'를 눌러 주세요.", color = pal.sub,
+                    modifier = Modifier.padding(16.dp))
+            }
+            items(extras, key = { it.id }) { e ->
+                val n = e.countIn(from, to)
+                Row(
+                    Modifier.fillMaxWidth().clickable { editing = e }.padding(horizontal = 16.dp, vertical = 12.dp),
+                    verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Text(c.name, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
-                        Text(won(mine.sumOf { it.signed }), fontWeight = FontWeight.SemiBold, fontSize = 17.sp)
+                    Column(Modifier.weight(1f)) {
+                        Text(e.name.ifBlank { "(이름 없음)" }, fontSize = 16.sp)
+                        Text(
+                            e.periodText() + if (n > 0) " · 이번 정산 ${n}회" else " · 이번 정산 해당 없음",
+                            color = if (n > 0) pal.sub else pal.red, fontSize = 13.sp
+                        )
                     }
-                    Text("${mine.size}건", color = Gray, fontSize = 13.sp)
-                    TextButton(onClick = { onShare(i) }, contentPadding = PaddingValues(0.dp)) {
-                        Text("메모장으로 보내기", color = Navy)
+                    Column(horizontalAlignment = Alignment.End) {
+                        Text(won(e.amount), fontWeight = FontWeight.SemiBold)
+                        if (n > 1) Text("= ${won(e.amount * n)}", color = pal.sub, fontSize = 13.sp)
+                    }
+                }
+                HorizontalDivider(color = pal.line)
+            }
+        }
+    }
+
+    editing?.let { e ->
+        ExtraDialog(
+            init = e,
+            onDismiss = { editing = null },
+            onDelete = if (extras.any { it.id == e.id }) ({ onChange(extras.filter { it.id != e.id }); editing = null }) else null,
+            onSave = { n ->
+                onChange(if (extras.any { it.id == n.id }) extras.map { if (it.id == n.id) n else it } else extras + n)
+                editing = null
+            }
+        )
+    }
+}
+
+@Composable
+fun MonthStepper(label: String, ym: Int, onChange: (Int) -> Unit) {
+    val pal = LocalPal.current
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Text(label, color = pal.sub, modifier = Modifier.width(56.dp))
+        TextButton(onClick = { onChange(ymAdd(ym, -1)) }) { Text("◀") }
+        Text(ymText(ym), fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
+        TextButton(onClick = { onChange(ymAdd(ym, 1)) }) { Text("▶") }
+    }
+}
+
+@Composable
+fun ExtraDialog(init: Extra, onDismiss: () -> Unit, onDelete: (() -> Unit)?, onSave: (Extra) -> Unit) {
+    val pal = LocalPal.current
+    var name by remember { mutableStateOf(init.name) }
+    var amount by remember { mutableStateOf(if (init.amount > 0) init.amount.toString() else "") }
+    var start by remember { mutableIntStateOf(init.startYm) }
+    // 0 매월 계속, 1 몇 개월, 2 한 번, 3 직접(종료월)
+    var kind by remember {
+        mutableIntStateOf(
+            when {
+                init.endYm == 0 -> 0
+                init.endYm == init.startYm -> 2
+                else -> 1
+            }
+        )
+    }
+    var months by remember {
+        mutableStateOf(if (init.endYm > init.startYm) (monthsBetween(init.startYm, init.endYm)).toString() else "3")
+    }
+    var end by remember { mutableIntStateOf(if (init.endYm > 0) init.endYm else ymAdd(init.startYm, 2)) }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor = pal.bg,
+        title = { Text(if (onDelete == null) "기타 비용 추가" else "기타 비용 고치기") },
+        text = {
+            Column(Modifier.verticalScroll(rememberScrollState())) {
+                OutlinedTextField(name, { name = it }, label = { Text("이름 (예: 관리비, 보험료)") },
+                    singleLine = true, modifier = Modifier.fillMaxWidth())
+                OutlinedTextField(amount, { amount = digits(it) }, label = { Text("금액(원) — 한 달 기준") },
+                    singleLine = true, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                    modifier = Modifier.fillMaxWidth())
+                Spacer(Modifier.height(10.dp))
+                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Chip("매월", kind == 0) { kind = 0 }
+                    Chip("몇 개월", kind == 1) { kind = 1 }
+                    Chip("한 번", kind == 2) { kind = 2 }
+                    Chip("직접", kind == 3) { kind = 3 }
+                }
+                Spacer(Modifier.height(8.dp))
+                MonthStepper("시작", start) { start = it; if (end < it) end = it }
+                when (kind) {
+                    1 -> {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            OutlinedTextField(months, { months = digits(it).take(3) }, singleLine = true,
+                                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                                modifier = Modifier.width(90.dp))
+                            Text("  개월 (${ymText(start)} ~ ${ymText(ymAdd(start, ((months.toIntOrNull() ?: 1).coerceAtLeast(1)) - 1))})",
+                                color = pal.sub)
+                        }
+                    }
+                    3 -> MonthStepper("끝", end) { end = if (it < start) start else it }
+                    0 -> Text("끝 없이 매달 들어가요", color = pal.sub, fontSize = 13.sp)
+                    else -> Text("${ymText(start)} 한 달만 들어가요", color = pal.sub, fontSize = 13.sp)
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = {
+                val endYm = when (kind) {
+                    0 -> 0
+                    1 -> ymAdd(start, ((months.toIntOrNull() ?: 1).coerceAtLeast(1)) - 1)
+                    2 -> start
+                    else -> maxOf(end, start)
+                }
+                onSave(init.copy(name = name.trim(), amount = amount.toLongOrNull() ?: 0L, startYm = start, endYm = endYm))
+            }) { Text("저장") }
+        },
+        dismissButton = {
+            Row {
+                if (onDelete != null) TextButton(onClick = onDelete) { Text("삭제", color = pal.red) }
+                TextButton(onClick = onDismiss) { Text("닫기") }
+            }
+        }
+    )
+}
+
+fun monthsBetween(a: Int, b: Int): Int = ((b / 100) * 12 + b % 100) - ((a / 100) * 12 + a % 100) + 1
+
+/* ---------- 설정 ---------- */
+
+@Composable
+fun SettingsScreen(
+    cards: List<CardConf>, hasPerm: () -> Boolean, askPerm: () -> Unit,
+    onBg: (Long) -> Unit, onSave: (List<CardConf>) -> Unit, onBack: () -> Unit,
+) {
+    val ctx = LocalContext.current
+    val pal = LocalPal.current
+    val scope = rememberCoroutineScope()
+    val list = remember { mutableStateListOf(*cards.toTypedArray()) }
+    val numText = remember { mutableStateMapOf(*cards.map { it.id to it.numbers.joinToString(", ") }.toTypedArray()) }
+    var open by remember { mutableStateOf<String?>(null) }
+    var found by remember { mutableStateOf<Pair<String, List<Pair<String, Int>>>?>(null) }
+    var bgNow by remember { mutableLongStateOf(Store.bgColor(ctx)) }
+
+    fun build() = list.map { c ->
+        c.copy(numbers = (numText[c.id] ?: "").split(",").map { digits(it) }.filter { it.isNotEmpty() })
+    }
+
+    fun move(i: Int, d: Int) {
+        val j = i + d
+        if (j < 0 || j >= list.size) return
+        val a = list[i]; list[i] = list[j]; list[j] = a
+    }
+
+    Column(Modifier.fillMaxSize()) {
+        TopBar("설정", onBack) { TextButton(onClick = { onSave(build()) }) { Text("저장", color = pal.accent) } }
+        Column(Modifier.padding(16.dp).verticalScroll(rememberScrollState())) {
+            Text("카드", fontWeight = FontWeight.Bold, fontSize = 16.sp)
+            Text("켜고 끄기, 화살표로 탭 순서 바꾸기. 카드를 누르면 문자 번호를 고칠 수 있어요.",
+                color = pal.sub, fontSize = 13.sp)
+            Spacer(Modifier.height(8.dp))
+
+            list.forEachIndexed { i, c ->
+                Column(
+                    Modifier.fillMaxWidth().padding(vertical = 4.dp)
+                        .background(pal.soft, RoundedCornerShape(12.dp))
+                ) {
+                    Row(
+                        Modifier.fillMaxWidth().clickable { open = if (open == c.id) null else c.id }
+                            .padding(start = 14.dp, end = 4.dp, top = 6.dp, bottom = 6.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(Modifier.weight(1f)) {
+                            Text(c.name, fontWeight = FontWeight.SemiBold, color = if (c.enabled) pal.text else pal.sub)
+                            Text(
+                                (numText[c.id] ?: "").ifBlank { "문자 번호 없음" },
+                                color = pal.sub, fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis
+                            )
+                        }
+                        TextButton(onClick = { move(i, -1) }, enabled = i > 0, contentPadding = PaddingValues(6.dp)) { Text("▲") }
+                        TextButton(onClick = { move(i, 1) }, enabled = i < list.size - 1, contentPadding = PaddingValues(6.dp)) { Text("▼") }
+                        Switch(checked = c.enabled, onCheckedChange = { v -> list[i] = c.copy(enabled = v) })
+                    }
+                    if (open == c.id) {
+                        Column(Modifier.padding(horizontal = 14.dp).padding(bottom = 12.dp)) {
+                            OutlinedTextField(c.name, { v -> list[i] = c.copy(name = v) }, label = { Text("카드 이름") },
+                                singleLine = true, modifier = Modifier.fillMaxWidth())
+                            OutlinedTextField(numText[c.id] ?: "", { v -> numText[c.id] = v },
+                                label = { Text("문자 번호 (여러 개는 쉼표로)") }, singleLine = true,
+                                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Phone),
+                                modifier = Modifier.fillMaxWidth())
+                            OutlinedTextField(c.keyword, { v -> list[i] = c.copy(keyword = v) },
+                                label = { Text("번호 찾기용 문자 속 단어") }, singleLine = true,
+                                modifier = Modifier.fillMaxWidth())
+                            Spacer(Modifier.height(6.dp))
+                            OutlinedButton(onClick = {
+                                if (!hasPerm()) {
+                                    askPerm()
+                                } else {
+                                    val kw = c.keyword; val id = c.id
+                                    scope.launch {
+                                        val r = withContext(Dispatchers.IO) {
+                                            try { SmsReader.findSenders(ctx, kw) } catch (_: Exception) { emptyList() }
+                                        }
+                                        found = id to r
+                                    }
+                                }
+                            }) { Text("최근 문자에서 번호 찾기") }
+                        }
                     }
                 }
             }
-            Spacer(Modifier.height(18.dp))
-            Text("총금액", color = Gray)
-            Text(
-                won(txns.filter { it.include }.sumOf { it.signed }),
-                fontSize = 34.sp, fontWeight = FontWeight.Bold, color = Navy
-            )
-            Spacer(Modifier.height(18.dp))
-            Text("저장된 파일", color = Gray, fontSize = 13.sp)
-            Text(savedNote, fontSize = 13.sp)
+
             Spacer(Modifier.height(24.dp))
-            Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                OutlinedButton(onClick = onReview, modifier = Modifier.weight(1f)) { Text("다시 검토") }
-                Button(onClick = onHome, modifier = Modifier.weight(1f)) { Text("처음으로") }
+            Text("배경색", fontWeight = FontWeight.Bold, fontSize = 16.sp)
+            Spacer(Modifier.height(10.dp))
+            BG_PRESETS.chunked(4).forEach { rowList ->
+                Row(Modifier.fillMaxWidth().padding(vertical = 6.dp), horizontalArrangement = Arrangement.SpaceAround) {
+                    rowList.forEach { p ->
+                        Column(horizontalAlignment = Alignment.CenterHorizontally,
+                            modifier = Modifier.clickable { bgNow = p.color; onBg(p.color) }.padding(4.dp)) {
+                            Box(
+                                Modifier.size(44.dp)
+                                    .background(Color(p.color.toInt()), CircleShape)
+                                    .border(if (bgNow == p.color) 3.dp else 1.dp,
+                                        if (bgNow == p.color) pal.accent else pal.line, CircleShape)
+                            )
+                            Text(p.name, fontSize = 12.sp, color = pal.sub)
+                        }
+                    }
+                }
             }
+            Spacer(Modifier.height(30.dp))
         }
+    }
+
+    found?.let { (id, res) ->
+        val c = list.firstOrNull { it.id == id }
+        AlertDialog(
+            onDismissRequest = { found = null },
+            containerColor = pal.bg,
+            title = { Text("${c?.name ?: ""} 번호 후보") },
+            text = {
+                if (res.isEmpty()) Text("최근 90일 문자에서 '${c?.keyword}' 결제 문자를 못 찾았어요.")
+                else Column {
+                    Text("눌러서 추가하세요", color = pal.sub, fontSize = 13.sp)
+                    res.take(8).forEach { (n, cnt) ->
+                        Text(
+                            "$n  (${cnt}건)", fontSize = 16.sp,
+                            modifier = Modifier.fillMaxWidth().clickable {
+                                val cur = (numText[id] ?: "").split(",").map { digits(it) }.filter { it.isNotEmpty() }
+                                if (n !in cur) numText[id] = (cur + n).joinToString(", ")
+                                found = null
+                            }.padding(vertical = 10.dp)
+                        )
+                    }
+                }
+            },
+            confirmButton = { TextButton(onClick = { found = null }) { Text("닫기") } }
+        )
     }
 }
