@@ -36,20 +36,18 @@ jobs:
       - name: Signing key (Secrets)
         env:
           KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
-          S_STORE_PW: ${{ secrets.KEYSTORE_PASSWORD }}
-          S_ALIAS: ${{ secrets.KEY_ALIAS }}
-          S_KEY_PW: ${{ secrets.KEY_PASSWORD }}
+          S_PW: ${{ secrets.KEYSTORE_PASSWORD }}
         run: |
-          if [ -n "$KEYSTORE_BASE64" ]; then
+          if [ -n "$KEYSTORE_BASE64" ] && [ -n "$S_PW" ]; then
             echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release.jks"
             {
               echo "KEYSTORE_FILE=$RUNNER_TEMP/release.jks"
-              echo "KEYSTORE_PASSWORD=$S_STORE_PW"
-              echo "KEY_ALIAS=$S_ALIAS"
-              echo "KEY_PASSWORD=$S_KEY_PW"
+              echo "KEYSTORE_PASSWORD=$S_PW"
+              echo "KEY_ALIAS=cardsummary"
+              echo "KEY_PASSWORD=$S_PW"
             } >> "$GITHUB_ENV"
           else
-            echo "서명 키 Secrets(KEYSTORE_BASE64 등)가 없습니다"; exit 1
+            echo "서명 키 Secrets(KEYSTORE_BASE64, KEYSTORE_PASSWORD)가 없습니다"; exit 1
           fi
 
       - name: Build
