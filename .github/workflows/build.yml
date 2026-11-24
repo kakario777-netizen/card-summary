@@ -1,12 +1,17 @@
 name: Build APK
 
+# 릴리스할 때만 빌드: v로 시작하는 태그를 올리거나 수동 실행
 on:
   push:
-    branches: [ main ]
+    tags: [ 'v*' ]
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
 
 jobs:
   build:
@@ -22,15 +27,40 @@ jobs:
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.9'
+          cache-read-only: false
+
+      - name: Signing key (Secrets)
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          S_STORE_PW: ${{ secrets.KEYSTORE_PASSWORD }}
+          S_ALIAS: ${{ secrets.KEY_ALIAS }}
+          S_KEY_PW: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          if [ -n "$KEYSTORE_BASE64" ]; then
+            echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release.jks"
+            {
+              echo "KEYSTORE_FILE=$RUNNER_TEMP/release.jks"
+              echo "KEYSTORE_PASSWORD=$S_STORE_PW"
+              echo "KEY_ALIAS=$S_ALIAS"
+              echo "KEY_PASSWORD=$S_KEY_PW"
+            } >> "$GITHUB_ENV"
+          elif [ -f app/cardsummary.jks ]; then
+            echo "Secrets 없음: 임시로 저장소 안 키 사용"
+            echo "KEYSTORE_FILE=$GITHUB_WORKSPACE/app/cardsummary.jks" >> "$GITHUB_ENV"
+            echo "KEYSTORE_PASSWORD=cardsummary" >> "$GITHUB_ENV"
+            echo "KEY_ALIAS=cardsummary" >> "$GITHUB_ENV"
+            echo "KEY_PASSWORD=cardsummary" >> "$GITHUB_ENV"
+          else
+            echo "서명 키 Secrets가 없습니다"; exit 1
+          fi
 
       - name: Build
         run: gradle :app:assembleRelease --no-daemon
 
-      - name: Rename APK
-        run: cp app/build/outputs/apk/release/app-release.apk card-summary-1.0.${{ github.run_number }}.apk
-
-      - name: Upload APK
-        uses: actions/upload-artifact@v4
+      - name: Release
+        uses: softprops/action-gh-release@v2
         with:
-          name: apk
-          path: card-summary-1.0.${{ github.run_number }}.apk
+          tag_name: ${{ github.ref_name }}
+          name: 카드 정리 ${{ github.ref_name }}
+          files: app/build/outputs/apk/release/app-release.apk
+          make_latest: true

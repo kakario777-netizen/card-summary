@@ -9,10 +9,10 @@ import java.util.regex.Pattern;
 /**
  * 카드 결제 문자 해석기.
  *
- * 현대)  [Web발신] / 현대 kt M할인형 승인 / 김*성 / 4,900원 일시불 / 11/03 11:42 / 네이버플러스멤 / 누적4,593,807원
- * 롯데)  알림 / 쿠팡(쿠페이) / 9,080원  승인 / 김*성 LG구독 5*4* / 일시불 10/27 18:16 / 누적 252,250원
- * 자동납부) [현대카드] 자동납부 승인 송*임님 KT인터넷제휴납부 27,500원
- * 이용안내) [현대카드] 서*희님 10월 버스+지하철 이용금액은 총 3,050원입니다
+ * 현대)  [Web발신] / 현대카드 승인 / 홍*동 / 12,000원 일시불 / 01/15 12:10 / 예시가맹점 / 누적100,000원
+ * 롯데)  알림 / 예시상점 / 9,000원  승인 / 홍*동 카드명 1*2* / 일시불 01/15 18:16 / 누적 200,000원
+ * 자동납부) [현대카드] 자동납부 승인 홍*동님 예시요금납부 20,000원
+ * 이용안내) [현대카드] 홍*동님 1월 버스+지하철 이용금액은 총 3,000원입니다
  */
 public final class SmsParser {
 
@@ -117,7 +117,7 @@ public final class SmsParser {
     }
 
     private static String findMerchant(String body, int amountPos) {
-        // 자동납부형: "...님 KT인터넷제휴납부 27,500원"
+        // 자동납부형: "...님 예시요금납부 20,000원"
         Matcher ap = AUTO_PAY.matcher(body.replace("\n", " "));
         if (ap.find()) {
             String s = clean(ap.group(1));
@@ -196,7 +196,7 @@ public final class SmsParser {
         String low = s.toLowerCase();
         if (low.equals("알림") || low.equals("일시불") || low.startsWith("[web")) return false;
         for (String k : NOT_MERCHANT) if (low.contains(k)) return false;
-        if (s.contains("*")) return false;                   // 김*성, 5*4* 같은 이름·카드번호 줄
+        if (s.contains("*")) return false;                   // 홍*동, 1*2* 같은 이름·카드번호 줄
         if (AMOUNT.matcher(s).find()) return false;          // 금액 줄
         if (DATE_TIME.matcher(s).find()) return false;       // 시각 줄
         if (INSTALL.matcher(s).matches()) return false;

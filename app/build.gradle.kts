@@ -5,6 +5,8 @@ plugins {
 }
 
 val buildNumber = (System.getenv("GITHUB_RUN_NUMBER") ?: "1").toInt()
+// 태그(v1.0.6)로 빌드하면 그 버전 이름을 씀
+val tagVersion = System.getenv("GITHUB_REF_NAME")?.takeIf { it.startsWith("v") }?.removePrefix("v")
 
 android {
     namespace = "com.kakario.cardsummary"
@@ -15,15 +17,17 @@ android {
         minSdk = 29
         targetSdk = 34
         versionCode = buildNumber
-        versionName = "1.0.$buildNumber"
+        versionName = tagVersion ?: "1.0.$buildNumber"
     }
 
     signingConfigs {
         create("release") {
-            storeFile = file("cardsummary.jks")
-            storePassword = "cardsummary"
-            keyAlias = "cardsummary"
-            keyPassword = "cardsummary"
+            // 서명 키는 GitHub Secrets(KEYSTORE_BASE64 등)에서 빌드 때만 풀어 씀
+            val ks = file(System.getenv("KEYSTORE_FILE") ?: "release.jks")
+            storeFile = ks
+            storePassword = System.getenv("KEYSTORE_PASSWORD") ?: ""
+            keyAlias = System.getenv("KEY_ALIAS") ?: ""
+            keyPassword = System.getenv("KEY_PASSWORD") ?: ""
         }
     }
 
