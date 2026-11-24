@@ -5,8 +5,8 @@ plugins {
 }
 
 val buildNumber = (System.getenv("GITHUB_RUN_NUMBER") ?: "1").toInt()
-// 태그(v1.0.6)로 빌드하면 그 버전 이름을 씀
-val tagVersion = System.getenv("GITHUB_REF_NAME")?.takeIf { it.startsWith("v") }?.removePrefix("v")
+// 버전 이름은 저장소 맨 위 VERSION 파일
+val tagVersion = rootProject.file("VERSION").takeIf { it.exists() }?.readText()?.trim()?.ifEmpty { null }
 
 android {
     namespace = "com.kakario.cardsummary"

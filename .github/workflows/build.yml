@@ -1,9 +1,10 @@
 name: Build APK
 
-# 릴리스할 때만 빌드: v로 시작하는 태그를 올리거나 수동 실행
+# 릴리스할 때만 빌드: VERSION 파일의 버전을 올려서 push하면 그 버전으로 릴리스
 on:
   push:
-    tags: [ 'v*' ]
+    branches: [ main ]
+    paths: [ 'VERSION' ]
   workflow_dispatch:
 
 permissions:
@@ -28,6 +29,9 @@ jobs:
         with:
           gradle-version: '8.9'
           cache-read-only: false
+
+      - name: Version
+        run: echo "APP_VERSION=$(tr -d ' \r\n' < VERSION)" >> "$GITHUB_ENV"
 
       - name: Signing key (Secrets)
         env:
@@ -60,7 +64,7 @@ jobs:
       - name: Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.ref_name }}
-          name: 카드 정리 ${{ github.ref_name }}
+          tag_name: v${{ env.APP_VERSION }}
+          name: 카드 정리 v${{ env.APP_VERSION }}
           files: app/build/outputs/apk/release/app-release.apk
           make_latest: true
