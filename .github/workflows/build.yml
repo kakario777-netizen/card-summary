@@ -48,14 +48,8 @@ jobs:
               echo "KEY_ALIAS=$S_ALIAS"
               echo "KEY_PASSWORD=$S_KEY_PW"
             } >> "$GITHUB_ENV"
-          elif [ -f app/cardsummary.jks ]; then
-            echo "Secrets 없음: 임시로 저장소 안 키 사용"
-            echo "KEYSTORE_FILE=$GITHUB_WORKSPACE/app/cardsummary.jks" >> "$GITHUB_ENV"
-            echo "KEYSTORE_PASSWORD=cardsummary" >> "$GITHUB_ENV"
-            echo "KEY_ALIAS=cardsummary" >> "$GITHUB_ENV"
-            echo "KEY_PASSWORD=cardsummary" >> "$GITHUB_ENV"
           else
-            echo "서명 키 Secrets가 없습니다"; exit 1
+            echo "서명 키 Secrets(KEYSTORE_BASE64 등)가 없습니다"; exit 1
           fi
 
       - name: Build
